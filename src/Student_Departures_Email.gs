@@ -1,16 +1,20 @@
 // ====== Student_Departures_Email.gs ======
-// Weekly Monday email listing students who are leaving the clinic, sent to Dr. Schultz.
+// Weekly Monday email listing students starting at / leaving the clinic, sent to Dr. Schultz.
 // Standalone module - all names prefixed with sd_ to avoid collisions with other scripts in this
 // project (e.g. the insurance email).
 //
 // Source of truth: the workbook's roster tab ("Staff and Students 25-26"). Per the roster layout,
 // student names are stacked in column C under section headers ("CCC Students", "PAC Students") and
-// each student's end date sits beside the name in column D.
+// each student's date sits beside the name in column D.
 //
-// Window (confirmed with the office): run Monday morning and report a two-week band centered on the
-// send day -- any student who LEFT in the past 7 days, plus any student LEAVING in the next 7 days.
+// Start vs. end: column D normally holds a student's END date. To flag an arrival instead, add the
+// word "START" to that cell (e.g. "START 6/25/26" or "6/25/26 (START)"); any cell containing START
+// is treated as a start date, everything else as an end date.
 //
-// End-date handling: dates may be written m/d/yy, mm/dd/yy, m/d/yyyy, etc. A date that is just a
+// Window (confirmed with the office): run Monday morning and report the upcoming week only --
+// any student starting OR leaving in the next 7 days (today through +7). Past dates are not listed.
+//
+// Date handling: dates may be written m/d/yy, mm/dd/yy, m/d/yyyy, etc. A date that is just a
 // placeholder (contains "?", "X", or "TBD") means the real date is unknown -- those students are
 // omitted entirely (we only list students with a confirmed date inside the window).
 //
@@ -28,7 +32,6 @@ const SD_CONFIG = {
   EMAIL_CC: '',            // set to '' for none
   NOTIFY_ON_ERROR: 'DrSchultz@CollectiveCareClinic.com', // gets a heads-up if the roster tab can't be found
   CLINIC_NAME: 'Collective Care Clinic',
-  WINDOW_BACK_DAYS: 7,     // students who left in the past 7 days
   WINDOW_FWD_DAYS: 7       // students leaving in the next 7 days
 };
 
@@ -65,19 +68,21 @@ function sd_runWeekly() {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  const entries = sd_collectDepartures(tab, today);
-  if (!entries.length) return; // nobody leaving in the window -> no email at all
+  const entries = sd_collectEntries(tab, today);
+  if (!entries.length) return; // nobody starting or leaving in the window -> no email at all
 
-  // Split into "recently left" (before today) and "leaving soon" (today through +7 days).
-  const todayYmd = sd_ymd(today);
-  const recent = entries.filter(e => e.ymd < todayYmd).sort((a, b) => a.ymd - b.ymd);
-  const upcoming = entries.filter(e => e.ymd >= todayYmd).sort((a, b) => a.ymd - b.ymd);
+  const sorted = entries.slice().sort((a, b) => a.ymd - b.ymd);
+  const starting = sorted.filter(e => e.kind === 'start');
+  const leaving = sorted.filter(e => e.kind === 'end');
 
-  const windowStart = sd_addDays(today, -SD_CONFIG.WINDOW_BACK_DAYS);
+  const windowStart = today;
   const windowEnd = sd_addDays(today, SD_CONFIG.WINDOW_FWD_DAYS);
-  const model = { today, windowStart, windowEnd, recent, upcoming, total: entries.length };
+  const model = { today, windowStart, windowEnd, starting, leaving, total: entries.length };
 
-  const subject = 'Student Departures: ' + entries.length + ' student' + (entries.length === 1 ? '' : 's') +
+  const parts = [];
+  if (leaving.length) parts.push(leaving.length + ' leaving');
+  if (starting.length) parts.push(starting.length + ' starting');
+  const subject = 'Student Roster: ' + parts.join(', ') +
     ' (' + sd_fmtShort(windowStart) + ' – ' + sd_fmtShort(windowEnd) + ')';
 
   MailApp.sendEmail({
@@ -102,9 +107,10 @@ function sd_findRosterSheet(ss) {
 }
 
 // Walk column C top to bottom, tracking the current section header. While inside a student section
-// (CCC / PAC), read the name + its end date (column D) and keep only students whose CONFIRMED end
-// date falls inside the window. Returns [{ name, clinic, date, ymd }].
-function sd_collectDepartures(tab, today) {
+// (CCC / PAC), read the name + its date (column D) and keep only students whose CONFIRMED date falls
+// inside the window. A date cell containing "START" is an arrival; otherwise it is a departure.
+// Returns [{ name, clinic, date, ymd, kind: 'start' | 'end' }].
+function sd_collectEntries(tab, today) {
   const lastRow = tab.getLastRow();
   if (lastRow < 1) return [];
 
@@ -114,7 +120,7 @@ function sd_collectDepartures(tab, today) {
   const dateRaw = tab.getRange(1, dateCol, lastRow, 1).getValues().flat();        // real Date if cell is a date
   const dateDisp = tab.getRange(1, dateCol, lastRow, 1).getDisplayValues().flat(); // text as shown (handles "TBD", "6/?/26")
 
-  const windowStartYmd = sd_ymd(sd_addDays(today, -SD_CONFIG.WINDOW_BACK_DAYS));
+  const windowStartYmd = sd_ymd(today);
   const windowEndYmd = sd_ymd(sd_addDays(today, SD_CONFIG.WINDOW_FWD_DAYS));
 
   const out = [];
@@ -137,7 +143,8 @@ function sd_collectDepartures(tab, today) {
     const ymd = sd_ymd(parsed);
     if (ymd < windowStartYmd || ymd > windowEndYmd) continue;
 
-    out.push({ name: sd_cleanName(cell), clinic: section.clinic, date: parsed, ymd });
+    const kind = /start/i.test(String(dateDisp[i] || '')) ? 'start' : 'end';
+    out.push({ name: sd_cleanName(cell), clinic: section.clinic, date: parsed, ymd, kind });
   }
   return out;
 }
@@ -217,39 +224,38 @@ function sd_cleanName(name) {
 function sd_buildEmailHtml(model) {
   const greeting =
     '<div style="padding:20px 30px 4px 30px;">' +
-      '<div style="font-size:17px;color:' + SD_C.navy + ';font-weight:700;letter-spacing:0.2px;">Student Departures</div>' +
+      '<div style="font-size:17px;color:' + SD_C.navy + ';font-weight:700;letter-spacing:0.2px;">Student Roster Changes</div>' +
       '<div style="font-size:13px;color:' + SD_C.muted + ';margin-top:4px;">' +
-        'Students leaving the clinic between ' + sd_esc(sd_fmtLong(model.windowStart)) +
+        'Students starting at or leaving the clinic between ' + sd_esc(sd_fmtLong(model.windowStart)) +
         ' and ' + sd_esc(sd_fmtLong(model.windowEnd)) + '.' +
       '</div>' +
     '</div>';
 
   let sections = '';
-  if (model.upcoming.length) {
-    sections += sd_card('Leaving This Week', sd_listBlock(model.upcoming, false));
+  if (model.starting.length) {
+    sections += sd_card('Starting This Week', sd_listBlock(model.starting, 'Starting', SD_C.green));
   }
-  if (model.recent.length) {
-    sections += sd_card('Recently Left (Past Week)', sd_listBlock(model.recent, true));
+  if (model.leaving.length) {
+    sections += sd_card('Leaving This Week', sd_listBlock(model.leaving, 'Leaving', SD_C.red));
   }
 
   const inner =
-    sd_letterhead('Weekly Student Departures') +
+    sd_letterhead('Weekly Student Roster Changes') +
     greeting +
     '<div style="padding:14px 30px 8px 30px;">' + sections + '</div>' +
     sd_footer();
   return sd_shell(inner);
 }
 
-// One student list. `past` tints the date label so a date already gone reads differently.
-function sd_listBlock(entries, past) {
-  const dateColor = past ? SD_C.redDark : SD_C.green;
+// One student list. `label` is the date prefix ("Starting" / "Leaving") and `dateColor` tints it.
+function sd_listBlock(entries, label, dateColor) {
   const rows = entries.map(e => {
     const tag = sd_clinicTag(e.clinic);
     return '<div style="padding:9px 0;border-bottom:1px solid ' + SD_C.line + ';">' +
         '<span style="font-size:14px;color:' + SD_C.text + ';font-weight:600;">' + sd_esc(e.name) + '</span>' +
         tag +
         '<div style="font-size:12.5px;color:' + dateColor + ';margin-top:2px;font-weight:600;">' +
-          (past ? 'Left ' : 'Leaving ') + sd_esc(sd_fmtLong(e.date)) +
+          label + ' ' + sd_esc(sd_fmtLong(e.date)) +
         '</div>' +
       '</div>';
   }).join('');
@@ -303,16 +309,16 @@ function sd_card(title, innerHtml) {
 }
 
 function sd_buildPlainText(model) {
-  let t = SD_CONFIG.CLINIC_NAME + ' — Weekly Student Departures\n';
+  let t = SD_CONFIG.CLINIC_NAME + ' — Weekly Student Roster Changes\n';
   t += 'Window: ' + sd_fmtLong(model.windowStart) + ' – ' + sd_fmtLong(model.windowEnd) + '\n\n';
-  if (model.upcoming.length) {
-    t += 'LEAVING THIS WEEK\n';
-    model.upcoming.forEach(e => { t += '- ' + e.name + ' (' + e.clinic + ') — leaving ' + sd_fmtLong(e.date) + '\n'; });
+  if (model.starting.length) {
+    t += 'STARTING THIS WEEK\n';
+    model.starting.forEach(e => { t += '- ' + e.name + ' (' + e.clinic + ') — starting ' + sd_fmtLong(e.date) + '\n'; });
     t += '\n';
   }
-  if (model.recent.length) {
-    t += 'RECENTLY LEFT (PAST WEEK)\n';
-    model.recent.forEach(e => { t += '- ' + e.name + ' (' + e.clinic + ') — left ' + sd_fmtLong(e.date) + '\n'; });
+  if (model.leaving.length) {
+    t += 'LEAVING THIS WEEK\n';
+    model.leaving.forEach(e => { t += '- ' + e.name + ' (' + e.clinic + ') — leaving ' + sd_fmtLong(e.date) + '\n'; });
     t += '\n';
   }
   t += '(Generated ' + sd_fmtLong(new Date()) + ')\n';
@@ -364,20 +370,20 @@ function sd_previewSample() {
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const model = {
     today,
-    windowStart: sd_addDays(today, -SD_CONFIG.WINDOW_BACK_DAYS),
+    windowStart: today,
     windowEnd: sd_addDays(today, SD_CONFIG.WINDOW_FWD_DAYS),
-    upcoming: [
-      { name: 'Jordan Avery', clinic: 'CCC', date: sd_addDays(today, 2), ymd: sd_ymd(sd_addDays(today, 2)) },
-      { name: 'Priya Nair', clinic: 'PAC', date: sd_addDays(today, 5), ymd: sd_ymd(sd_addDays(today, 5)) }
+    starting: [
+      { name: 'Riley Chen', clinic: 'CCC', date: sd_addDays(today, 1), ymd: sd_ymd(sd_addDays(today, 1)), kind: 'start' }
     ],
-    recent: [
-      { name: 'Sam Whitfield', clinic: 'CCC', date: sd_addDays(today, -3), ymd: sd_ymd(sd_addDays(today, -3)) }
+    leaving: [
+      { name: 'Jordan Avery', clinic: 'CCC', date: sd_addDays(today, 2), ymd: sd_ymd(sd_addDays(today, 2)), kind: 'end' },
+      { name: 'Priya Nair', clinic: 'PAC', date: sd_addDays(today, 5), ymd: sd_ymd(sd_addDays(today, 5)), kind: 'end' }
     ],
     total: 3
   };
   MailApp.sendEmail({
     to: SD_CONFIG.NOTIFY_ON_ERROR || SD_CONFIG.EMAIL_TO,
-    subject: '[PREVIEW] Weekly Student Departures',
+    subject: '[PREVIEW] Weekly Student Roster Changes',
     body: sd_buildPlainText(model),
     htmlBody: sd_buildEmailHtml(model)
   });
